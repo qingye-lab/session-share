@@ -1,4 +1,4 @@
-name: Tests and macOS build
+name: Native Swift tests and macOS build
 
 on:
   push:
@@ -12,8 +12,13 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - run: ./tests/run.sh
+      - run: ./scripts/build-cli.sh
+      - run: ./scripts/package.sh
+      - uses: actions/upload-artifact@v4
         with:
-          node-version: '22'
-      - run: npm test
-      - run: ./build.sh
+          name: Session-Share-macOS-arm64
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS.txt

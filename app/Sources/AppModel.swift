@@ -21,12 +21,16 @@ final class AppModel: ObservableObject {
     @Published var snapshot: Snapshot?
     @Published var loadError: String?
     @Published var loading = false
+    @Published private(set) var saving = false
     @Published var phase: Phase = .idle
     @Published var claudeRunning = false
     @Published var tab: Tab = .desktop
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private var timer: Timer?
+    private var refreshTask: Task<Void, Never>?
+    private var pendingSettings: [[String]] = []
+    private var stateRevision = 0
 
     init() {
         claudeRunning = Self.isClaudeRunning()
@@ -57,20 +61,43 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    var confirming: Bool { phase == .confirmMerge || phase == .confirmUndo }
+    var interactionLocked: Bool { saving || busy || confirming }
     var pending: Bool { (snapshot?.changes ?? 0) > 0 }
 
     // MARK: reading
 
     func refresh() async {
-        loading = true
-        defer { loading = false }
-        claudeRunning = Self.isClaudeRunning()
-        do {
-            snapshot = try await Engine.state()
-            loadError = nil
-        } catch {
-            loadError = error.localizedDescription
+        // The settings queue performs one final read after all queued writes.
+        guard !saving, !busy else { return }
+        await refreshState()
+    }
+
+    private func refreshState() async {
+        if let refreshTask {
+            await refreshTask.value
+            return
         }
+        loading = true
+        let revision = stateRevision
+        let task = Task {
+            defer {
+                refreshTask = nil
+                loading = false
+            }
+            claudeRunning = Self.isClaudeRunning()
+            do {
+                let state = try await Engine.state()
+                guard revision == stateRevision else { return }
+                snapshot = state
+                loadError = nil
+            } catch {
+                guard revision == stateRevision else { return }
+                loadError = error.localizedDescription
+            }
+        }
+        refreshTask = task
+        await task.value
     }
 
     /// Called when the panel opens: a stale result or confirmation is cleared.
@@ -85,27 +112,44 @@ final class AppModel: ObservableObject {
     // MARK: settings
 
     func setProject(_ path: String, on: Bool) {
+        guard !busy, !confirming else { return }
         if let i = snapshot?.projects.firstIndex(where: { $0.path == path }) { snapshot?.projects[i].on = on }
         save(["set", "desktop", path, on ? "on" : "off"])
     }
 
     func setTerminal(_ path: String, on: Bool) {
+        guard !busy, !confirming else { return }
         if let i = snapshot?.terminal.firstIndex(where: { $0.path == path }) { snapshot?.terminal[i].on = on }
         save(["set", "terminal", path, on ? "on" : "off"])
     }
 
     func setRemark(_ uuid: String, _ remark: String) {
+        guard !busy, !confirming else { return }
         save(["remark", uuid, remark.trimmingCharacters(in: .whitespacesAndNewlines)])
     }
 
     private func save(_ args: [String]) {
+        stateRevision += 1
+        pendingSettings.append(args)
+        guard !saving else { return }
+        saving = true
         Task {
-            do {
-                _ = try await Engine.run(args)
-            } catch {
-                phase = .failed(error.localizedDescription)
-            }
-            await refresh()
+            // Let an older read finish; its revision check discards its result.
+            await refreshTask?.value
+            repeat {
+                while !pendingSettings.isEmpty {
+                    let args = pendingSettings.removeFirst()
+                    do {
+                        _ = try await Engine.run(args)
+                    } catch {
+                        phase = .failed(error.localizedDescription)
+                    }
+                }
+                // New toggles can arrive during this read. They invalidate it and
+                // keep the queue running until the persisted state is settled.
+                await refreshState()
+            } while !pendingSettings.isEmpty
+            saving = false
         }
     }
 
@@ -121,23 +165,44 @@ final class AppModel: ObservableObject {
     // MARK: merging
 
     func mergeTapped() {
-        if claudeRunning { phase = .confirmMerge } else { Task { await merge() } }
+        guard !interactionLocked else { return }
+        if claudeRunning {
+            phase = .confirmMerge
+        } else if beginOperation("合并") {
+            Task { await withClaudeClosed(verb: "合并", args: ["sync-all"]) }
+        }
     }
 
-    func undoTapped() { phase = .confirmUndo }
+    func undoTapped() {
+        guard !interactionLocked else { return }
+        phase = .confirmUndo
+    }
 
-    func cancel() { phase = .idle }
+    func cancel() {
+        guard !busy else { return }
+        phase = .idle
+    }
 
     func merge() async {
+        guard phase != .confirmUndo, beginOperation("合并") else { return }
         await withClaudeClosed(verb: "合并", args: ["sync-all"])
     }
 
     func undo() async {
+        guard phase != .confirmMerge, beginOperation("撤销") else { return }
         await withClaudeClosed(verb: "撤销", args: ["undo"])
+    }
+
+    private func beginOperation(_ verb: String) -> Bool {
+        guard !saving, !busy else { return false }
+        stateRevision += 1
+        phase = .working(verb == "合并" ? "正在合并会话…" : "正在撤销上次合并…")
+        return true
     }
 
     /// Quits Claude, runs the engine, opens Claude again.
     private func withClaudeClosed(verb: String, args: [String]) async {
+        await refreshTask?.value
         let wasRunning = Self.isClaudeRunning()
         if wasRunning {
             phase = .working("正在关闭 Claude…")
@@ -147,17 +212,19 @@ final class AppModel: ObservableObject {
             }
         }
         phase = .working(verb == "合并" ? "正在合并会话…" : "正在撤销上次合并…")
+        let result: Phase
         do {
             let message = try await Engine.run(args)
             phase = .working("正在打开 Claude…")
             openClaude()
-            phase = .done(message)
+            result = .done(message)
             notify(title: "\(verb)完成", body: message)
         } catch {
             if wasRunning { openClaude() }
-            phase = .failed("\(verb)失败：\(error.localizedDescription)")
+            result = .failed("\(verb)失败：\(error.localizedDescription)")
         }
-        await refresh()
+        await refreshState()
+        phase = result
     }
 
     func openClaude() {

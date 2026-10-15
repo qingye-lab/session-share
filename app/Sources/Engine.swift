@@ -1,9 +1,8 @@
 import Foundation
 
-// The merge itself lives in cli.mjs/core.mjs inside the app's Resources; this
-// runs it and decodes what it prints.
+// Native Swift engine; the Snapshot contract is shared with the menu bar UI.
 
-struct Snapshot: Decodable {
+struct Snapshot: Codable {
     var sessions: Int
     var changes: Int
     var imports: Int
@@ -14,13 +13,13 @@ struct Snapshot: Decodable {
     var projects: [Project]
     var terminal: [TerminalGroup]
 
-    struct LastRun: Decodable {
+    struct LastRun: Codable {
         var at: Double
         var changes: Int
         var date: Date { Date(timeIntervalSince1970: at / 1000) }
     }
 
-    struct Account: Decodable {
+    struct Account: Codable {
         var key: String
         var uuid: String
         var gateway: Bool
@@ -42,7 +41,7 @@ struct Snapshot: Decodable {
         var after: Int { have + add - remove }
     }
 
-    struct Project: Decodable {
+    struct Project: Codable {
         var path: String
         var name: String
         var count: Int
@@ -51,12 +50,12 @@ struct Snapshot: Decodable {
         var from: [Origin]
     }
 
-    struct Origin: Decodable {
+    struct Origin: Codable {
         var name: String
         var count: Int
     }
 
-    struct TerminalGroup: Decodable {
+    struct TerminalGroup: Codable {
         var path: String
         var name: String
         var count: Int
@@ -64,8 +63,8 @@ struct Snapshot: Decodable {
         var on: Bool
     }
 
-    /// Accounts whose sidebar is missing sessions.
-    var behind: [Account] { accounts.filter { $0.add > 0 || $0.remove > 0 } }
+    /// Accounts whose sidebar has pending changes.
+    var behind: [Account] { accounts.filter { $0.add > 0 || $0.update > 0 || $0.remove > 0 } }
 }
 
 struct EngineError: LocalizedError {
@@ -74,31 +73,20 @@ struct EngineError: LocalizedError {
 }
 
 enum Engine {
+    // One queue for reads and writes, including settings learned during scans.
+    private static let queue = DispatchQueue(label: "session-share.engine", qos: .userInitiated)
+
     static func call(_ args: [String]) throws -> String {
-        guard let runner = Bundle.main.url(forResource: "run", withExtension: "sh") else {
-            throw EngineError(message: "程序包不完整：找不到 run.sh，请重新打包")
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = [runner.path] + args
-        let out = Pipe()
-        let err = Pipe()
-        p.standardOutput = out
-        p.standardError = err
-        try p.run()
-        let o = out.fileHandleForReading.readDataToEndOfFile()
-        let e = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let text = String(decoding: o, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard p.terminationStatus == 0 else {
-            let msg = String(decoding: e, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw EngineError(message: msg.isEmpty ? "出错了（退出码 \(p.terminationStatus)）" : msg)
-        }
-        return text
+        try queue.sync { try NativeMerge().command(args) }
     }
 
     static func run(_ args: [String]) async throws -> String {
-        try await Task.detached { try call(args) }.value
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do { continuation.resume(returning: try NativeMerge().command(args)) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
     }
 
     static func state() async throws -> Snapshot {
